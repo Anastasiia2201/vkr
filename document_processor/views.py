@@ -1,15 +1,30 @@
-import requests
-from django.contrib.gis.geos import GEOSGeometry
+from django.http import JsonResponse
+from django.views.decorators.http import require_GET
+
+from document_processor.services.rosreestr import (
+    RosreestrError,
+    RosreestrNotFoundError,
+    fetch_location_by_cadastral_number,
+)
 
 
-def fetch_geometry(cadastral_number):
-    url = f"https://pkk.rosreestr.ru/api/features/1/{cadastral_number}"
-    response = requests.get(url)
+@require_GET
+def cadastral_location_view(request, cadastral_number: str) -> JsonResponse:
+    try:
+        location = fetch_location_by_cadastral_number(cadastral_number)
+    except RosreestrNotFoundError as exc:
+        return JsonResponse({"detail": str(exc)}, status=404)
+    except RosreestrError as exc:
+        return JsonResponse({"detail": str(exc)}, status=502)
 
-    if response.status_code != 200:
-        return None
-
-    data = response.json()
-
-    geom_json = data['feature']['geometry']
-    return GEOSGeometry(str(geom_json))
+    return JsonResponse(
+        {
+            "cadastral_number": location.cadastral_number,
+            "address": location.address,
+            "center": {
+                "lat": location.center_lat,
+                "lon": location.center_lon,
+            },
+            "geometry": location.geometry.geojson if location.geometry else None,
+        }
+    )
