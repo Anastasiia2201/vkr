@@ -1,19 +1,19 @@
 import json
+import subprocess
 from dataclasses import dataclass
-from typing import Any
+from pathlib import Path
 
-import requests
-from django.contrib.gis.geos import GEOSGeometry
+from django.contrib.gis.geos import GEOSGeometry, MultiPolygon
+from django.db import transaction
 
-ROSREESTR_FEATURE_URL = "https://pkk.rosreestr.ru/api/features/1/{cadastral_number}"
+from document_processor.models import LandCategory, LandPlot
+
+
+GEOJSON_DIR = Path("output/geojson")
 
 
 class RosreestrError(Exception):
-    """Базовая ошибка работы с API Росреестра."""
-
-
-class RosreestrNotFoundError(RosreestrError):
-    """Кадастровый номер не найден в API Росреестра."""
+    pass
 
 
 @dataclass
@@ -25,62 +25,84 @@ class CadastralLocation:
     geometry: GEOSGeometry | None
 
 
-def fetch_location_by_cadastral_number(
-    cadastral_number: str,
-    timeout: int = 15,
-) -> CadastralLocation:
-    """Получить геометрию и центр участка по кадастровому номеру."""
-    response = requests.get(
-        ROSREESTR_FEATURE_URL.format(cadastral_number=cadastral_number),
-        timeout=timeout,
-    )
-
-    if response.status_code == 404:
-        raise RosreestrNotFoundError(
-            f"Кадастровый номер {cadastral_number} не найден"
+def fetch_location_by_cadastral_number(cadastral_number: str) -> CadastralLocation:
+    try:
+        land_plot = LandPlot.objects.select_related("land_category").get(
+            cadastral_number=cadastral_number
         )
 
-    if response.status_code != 200:
-        raise RosreestrError(
-            f"Ошибка API Росреестра. Код ответа: {response.status_code}"
+        if land_plot.geometry:
+            centroid = land_plot.geometry.centroid
+            return CadastralLocation(
+                cadastral_number=land_plot.cadastral_number,
+                address=land_plot.location,
+                center_lat=centroid.y,
+                center_lon=centroid.x,
+                geometry=land_plot.geometry,
+            )
+    except LandPlot.DoesNotExist:
+        land_plot = None
+
+    if not land_plot:
+        try:
+            subprocess.run(
+                ["rosreestr2coord", "-c", cadastral_number],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=True,
+            )
+        except FileNotFoundError as exc:
+            raise RosreestrError("Утилита rosreestr2coord не установлена") from exc
+        except subprocess.CalledProcessError as exc:
+            raise RosreestrError("Ошибка выполнения rosreestr2coord") from exc
+
+    try:
+        geojson_path = GEOJSON_DIR / f"{cadastral_number.replace(':', '_')}.geojson"
+        data = json.loads(geojson_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise RosreestrError(f"GeoJSON файл не найден: {geojson_path}") from exc
+    except json.JSONDecodeError as exc:
+        raise RosreestrError("Ошибка чтения GeoJSON") from exc
+
+    geometry = GEOSGeometry(json.dumps(data["geometry"]))
+    geometry_wgs84 = geometry.clone()
+    geometry_wgs84.transform(4326)
+
+    if geometry_wgs84.geom_type == "Polygon":
+        geometry_wgs84 = MultiPolygon(geometry_wgs84, srid=4326)
+
+    centroid = geometry_wgs84.centroid
+
+    options = data["properties"]["options"]
+
+    address = options.get("readable_address")
+    category_name = options.get("land_record_category_type")
+    use_type = options.get("permitted_use_established_by_document")
+    specified_area = options.get("specified_area")
+
+    area_hectares = specified_area / 10000 if specified_area else None
+
+    with transaction.atomic():
+        land_category = None
+        if category_name:
+            land_category, _ = LandCategory.objects.get_or_create(name=category_name)
+
+        land_plot, _ = LandPlot.objects.update_or_create(
+            cadastral_number=cadastral_number,
+            defaults={
+                "location": address or "",
+                "land_category": land_category,
+                "area_hectares": area_hectares,
+                "geometry": geometry_wgs84,
+                "use_type": use_type,
+            },
         )
-
-    data = response.json()
-    feature: dict[str, Any] = data.get("feature") or {}
-    attrs: dict[str, Any] = feature.get("attrs") or {}
-
-    geometry_data = feature.get("geometry")
-    geometry = _to_geos_geometry(geometry_data)
-
-    center = feature.get("center")
 
     return CadastralLocation(
-        cadastral_number=cadastral_number,
-        address=attrs.get("address") or attrs.get("readable_address"),
-        center_lat=_extract_center_lat(center),
-        center_lon=_extract_center_lon(center),
-        geometry=geometry,
+        cadastral_number=land_plot.cadastral_number,
+        address=land_plot.location,
+        center_lat=centroid.y,
+        center_lon=centroid.x,
+        geometry=land_plot.geometry,
     )
-
-
-def _to_geos_geometry(geometry_data: dict[str, Any] | None) -> GEOSGeometry | None:
-    if not geometry_data:
-        return None
-
-    return GEOSGeometry(json.dumps(geometry_data), srid=4326)
-
-
-def _extract_center_lat(center: Any) -> float | None:
-    if isinstance(center, dict):
-        return center.get("y")
-    if isinstance(center, list) and len(center) > 1:
-        return center[1]
-    return None
-
-
-def _extract_center_lon(center: Any) -> float | None:
-    if isinstance(center, dict):
-        return center.get("x")
-    if isinstance(center, list) and center:
-        return center[0]
-    return None

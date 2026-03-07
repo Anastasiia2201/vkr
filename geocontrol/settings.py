@@ -76,6 +76,11 @@ DATABASES = {
     )
 }
 
+DATABASES["default"]["TEST"] = {
+    "NAME": "test_geocontrol",
+    "TEMPLATE": "template_postgis",
+}
+
 
 # Password validation
 # https://docs.djangoproject.com/en/5.2/ref/settings/#auth-password-validators
