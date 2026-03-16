@@ -142,3 +142,9 @@ dmypy.json
 
 static/
 media/
+
+output/
+tmp/
+test_rosreestr_tojson/
+.log
+.geojson

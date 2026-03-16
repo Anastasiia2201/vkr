@@ -1,5 +1,44 @@
 from django.contrib.gis.db import models
-from django.contrib.gis.db.models.functions import Area
+from .services.storage import source_document_upload_path
+
+
+class SourceDocument(models.Model):
+    class DocumentType(models.TextChoices):
+        EGRN = "egrn", "Выписка ЕГРН"
+        AUCTION_PROTOCOL = "auction_protocol", "Протокол торгов"
+        SALE_CONTRACT = "sale_contract", "Договор купли-продажи"
+        UNKNOWN = "unknown", "Неизвестно"
+
+    class ProcessingStatus(models.TextChoices):
+        UPLOADED = "uploaded", "Загружен"
+        PROCESSED = "processed", "Обработан"
+        FAILED = "failed", "Ошибка"
+
+    file = models.FileField(upload_to=source_document_upload_path)
+    original_filename = models.CharField(max_length=255, blank=True)
+    document_type = models.CharField(
+        max_length=32,
+        choices=DocumentType.choices,
+        default=DocumentType.UNKNOWN
+    )
+    text_content = models.TextField(blank=True)
+    ocr_used = models.BooleanField(default=False)
+    status = models.CharField(
+        max_length=16,
+        choices=ProcessingStatus.choices,
+        default=ProcessingStatus.UPLOADED
+    )
+    confidence = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        null=True,
+        blank=True
+    )
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return self.original_filename or f"Документ #{self.pk}"
 
 
 class LandCategory(models.Model):
@@ -30,6 +69,13 @@ class LandPlot(models.Model):
     )
     use_type = models.CharField(max_length=255, null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    egrn_source_document = models.ForeignKey(
+        SourceDocument,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="egrn_land_plots"
+    )
 
     def calculate_area(self):
         if self.geometry:
@@ -84,6 +130,13 @@ class Contract(models.Model):
     land_plot = models.ForeignKey(
         LandPlot,
         on_delete=models.CASCADE,
+        related_name="contracts"
+    )
+    source_document = models.ForeignKey(
+        SourceDocument,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
         related_name="contracts"
     )
     source_url = models.TextField(blank=True)
