@@ -1,29 +1,6 @@
 import re
 
 
-def parse_auction_protocol(text: str) -> dict:
-    result = {
-        "cadastral_number": None,
-        "procedure_number": None,
-        "seller_name": None,
-        "buyer_name": None,
-        "confidence": 0.70,
-    }
-
-    cadastral_match = re.search(r"\b\d{2}:\d{2}:\d{6,7}:\d+\b", text)
-    if cadastral_match:
-        result["cadastral_number"] = cadastral_match.group(0)
-
-    procedure_match = re.search(
-        r"№\s*([0-9]{10,})",
-        text
-    )
-    if procedure_match:
-        result["procedure_number"] = procedure_match.group(1)
-
-    return result
-
-
 def parse_egrn_document(text: str) -> dict:
     result = {
         "cadastral_number": None,
@@ -31,7 +8,6 @@ def parse_egrn_document(text: str) -> dict:
         "location": None,
         "land_category": None,
         "use_type": None,
-        "confidence": 0.80,
     }
 
     cadastral_match = re.search(r"\b\d{2}:\d{2}:\d{6,7}:\d+\b", text)

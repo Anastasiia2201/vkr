@@ -6,7 +6,7 @@ from pathlib import Path
 from django.contrib.gis.geos import GEOSGeometry, MultiPolygon
 from django.db import transaction
 
-from document_processor.models import LandCategory, LandPlot
+from document_processor.models import LandPlot
 
 
 GEOJSON_DIR = Path("output/geojson")
@@ -26,24 +26,9 @@ class CadastralLocation:
 
 
 def fetch_location_by_cadastral_number(cadastral_number: str) -> CadastralLocation:
-    try:
-        land_plot = LandPlot.objects.select_related("land_category").get(
-            cadastral_number=cadastral_number
-        )
+    
 
-        if land_plot.geometry:
-            centroid = land_plot.geometry.centroid
-            return CadastralLocation(
-                cadastral_number=land_plot.cadastral_number,
-                address=land_plot.location,
-                center_lat=centroid.y,
-                center_lon=centroid.x,
-                geometry=land_plot.geometry,
-            )
-    except LandPlot.DoesNotExist:
-        land_plot = None
-
-    if not land_plot:
+    if 1:
         try:
             subprocess.run(
                 ["rosreestr2coord", "-c", cadastral_number],
@@ -65,38 +50,57 @@ def fetch_location_by_cadastral_number(cadastral_number: str) -> CadastralLocati
     except json.JSONDecodeError as exc:
         raise RosreestrError("Ошибка чтения GeoJSON") from exc
 
-    geometry = GEOSGeometry(json.dumps(data["geometry"]))
-    geometry_wgs84 = geometry.clone()
-    geometry_wgs84.transform(4326)
+    raw_geometry = GEOSGeometry(json.dumps(data["geometry"]))
+
+    minx, miny, maxx, maxy = raw_geometry.extent
+
+    looks_like_wgs84 = (
+        -180 <= minx <= 180 and
+        -180 <= maxx <= 180 and
+        -90 <= miny <= 90 and
+        -90 <= maxy <= 90
+    )
+
+    if looks_like_wgs84:
+        # Координаты уже похожи на EPSG:4326,
+        # даже если в crs ошибочно указан 3857
+        raw_geometry.srid = 4326
+        geometry_wgs84 = raw_geometry
+    else:
+        # Иначе считаем, что это действительно 3857
+        if raw_geometry.srid is None:
+            raw_geometry.srid = 3857
+
+        geometry_wgs84 = raw_geometry.clone()
+        geometry_wgs84.transform(4326)
 
     if geometry_wgs84.geom_type == "Polygon":
         geometry_wgs84 = MultiPolygon(geometry_wgs84, srid=4326)
 
     centroid = geometry_wgs84.centroid
-
-    options = data["properties"]["options"]
+    options = (data.get("properties") or {}).get("options") or {}
 
     address = options.get("readable_address")
-    category_name = options.get("land_record_category_type")
     use_type = options.get("permitted_use_established_by_document")
     specified_area = options.get("specified_area")
 
     area_hectares = specified_area / 10000 if specified_area else None
 
     with transaction.atomic():
-        land_category = None
-        if category_name:
-            land_category, _ = LandCategory.objects.get_or_create(name=category_name)
+        defaults = {
+            "location": address or "",
+            "geometry": geometry_wgs84,
+        }
+
+        if area_hectares is not None:
+            defaults["area_hectares"] = area_hectares
+
+        if use_type:
+            defaults["use_type"] = use_type
 
         land_plot, _ = LandPlot.objects.update_or_create(
             cadastral_number=cadastral_number,
-            defaults={
-                "location": address or "",
-                "land_category": land_category,
-                "area_hectares": area_hectares,
-                "geometry": geometry_wgs84,
-                "use_type": use_type,
-            },
+            defaults=defaults,
         )
 
     return CadastralLocation(

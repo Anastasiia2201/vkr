@@ -148,3 +148,15 @@ tmp/
 test_rosreestr_tojson/
 .log
 .geojson
+
+egrn/
+dataset_images/
+dataset_images_manual/
+catboost_info/
+
+*.json
+*.png
+
+ignore/
+backup.sql
+merge.py

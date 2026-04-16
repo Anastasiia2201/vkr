@@ -33,6 +33,7 @@ INSTALLED_APPS = [
     'django.contrib.gis',
     'rest_framework',
     'document_processor',
+    'satellite_processor',
 ]
 
 MIDDLEWARE = [
@@ -72,7 +73,7 @@ DATABASES = {
     'default': dj_database_url.config(
         default=os.environ.get('DATABASE_URL'),
         engine='django.contrib.gis.db.backends.postgis',
-        conn_max_age=600
+        conn_max_age=0
     )
 }
 
