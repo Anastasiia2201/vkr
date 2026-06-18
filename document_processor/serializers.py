@@ -1,5 +1,7 @@
 import re
+import base64
 
+from django.core.files.base import ContentFile
 from rest_framework import serializers
 
 from .services.storage import calculate_file_hash
@@ -24,15 +26,16 @@ class SourceDocumentSerializer(serializers.ModelSerializer):
             "status",
             "metadata",
             "created_at",
+            "ocr_result_dir",
         ]
         read_only_fields = [
             "original_filename",
-            "document_type",
             "text_content",
             "ocr_used",
             "status",
             "metadata",
             "created_at",
+            "ocr_result_dir",
         ]
 
     def create(self, validated_data):
@@ -163,9 +166,55 @@ class ExtractTextRequestSerializer(serializers.Serializer):
 
 
 class RentContractLLMTestSerializer(serializers.Serializer):
-    text = serializers.CharField(required=True, allow_blank=False)
+    document_id = serializers.IntegerField(required=True)
+    force = serializers.BooleanField(required=False, default=False)
 
 
 class ExtractTextResponseSerializer(serializers.Serializer):
     text = serializers.CharField()
     ocr_used = serializers.BooleanField()
+
+class SourceDocumentBase64UploadSerializer(serializers.Serializer):
+    filename = serializers.CharField(required=True)
+    content_base64 = serializers.CharField(required=True)
+    document_type = serializers.ChoiceField(
+        choices=SourceDocument.DocumentType.choices,
+        required=False,
+        default=SourceDocument.DocumentType.UNKNOWN,
+    )
+    force_reprocess = serializers.BooleanField(required=False, default=False)
+
+    def create(self, validated_data):
+        filename = validated_data["filename"]
+        content_base64 = validated_data["content_base64"]
+        document_type = validated_data.get(
+            "document_type",
+            SourceDocument.DocumentType.UNKNOWN,
+        )
+
+        try:
+            file_bytes = base64.b64decode(content_base64)
+        except Exception:
+            raise serializers.ValidationError(
+                {"content_base64": "Некорректная Base64-строка."}
+            )
+
+        uploaded_file = ContentFile(file_bytes, name=filename)
+
+        file_hash = calculate_file_hash(uploaded_file)
+
+        existing_document = SourceDocument.objects.filter(
+            file_hash=file_hash
+        ).first()
+
+        if existing_document:
+            return existing_document
+
+        document = SourceDocument.objects.create(
+            file=uploaded_file,
+            original_filename=filename,
+            document_type=document_type,
+            file_hash=file_hash,
+        )
+
+        return document

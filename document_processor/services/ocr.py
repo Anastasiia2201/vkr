@@ -1,148 +1,164 @@
 from __future__ import annotations
 
 import io
+import json
 import re
+import shutil
+import tempfile
 import time
+from dataclasses import dataclass
+from pathlib import Path
 
-import cv2
 import fitz
-import numpy as np
-import pytesseract
+from django.conf import settings
+from django.utils import timezone
 from PIL import Image
+from paddleocr import PPStructureV3
 
 
-OCR_LANG = "rus+eng"
+OCR_ENGINE = "ppstructurev3"
 
-RENDER_SCALE = 2.5
+RENDER_SCALE = 1.2
+MAX_PAGES_FOR_OCR = 10
+MAX_DOCUMENT_OCR_SECONDS = 300
 MIN_TEXT_LEN = 20
-MAX_IMAGE_SIDE = 6000
-
-TESSERACT_TIMEOUT = 12
-FAST_TESSERACT_TIMEOUT = 5
-
-MAX_PAGE_OCR_SECONDS = 20
-MAX_DOCUMENT_OCR_SECONDS = 120
-MAX_PAGES_FOR_OCR = 7
 
 
-def pil_to_bgr(image: Image.Image) -> np.ndarray:
-    rgb = image.convert("RGB")
-    return cv2.cvtColor(np.array(rgb), cv2.COLOR_RGB2BGR)
+_pipeline = None
 
 
-def resize_if_needed(
-    image: np.ndarray,
-    max_side: int = MAX_IMAGE_SIDE,
-) -> np.ndarray:
-    h, w = image.shape[:2]
-    current_max = max(h, w)
+@dataclass
+class OCRPageResult:
+    page: int
+    text: str
+    text_length: int
+    markdown_path: str | None = None
 
-    if current_max <= max_side:
-        return image
 
-    scale = max_side / current_max
-    return cv2.resize(
-        image,
-        None,
-        fx=scale,
-        fy=scale,
-        interpolation=cv2.INTER_AREA,
+def get_pipeline():
+    """
+    Ленивая загрузка PPStructureV3.
+    Модель тяжёлая, поэтому не создаём её при импорте файла.
+    """
+    global _pipeline
+
+    if _pipeline is None:
+        _pipeline = PPStructureV3(lang="ru")
+
+    return _pipeline
+
+
+def get_ocr_result_dir_for_document(document_id: int) -> Path:
+    return Path(settings.MEDIA_ROOT) / "ocr_results" / f"document_{document_id}"
+
+
+def build_ocr_result_dir_for_document(document_id: int) -> Path:
+    result_dir = get_ocr_result_dir_for_document(document_id)
+    result_dir.mkdir(parents=True, exist_ok=True)
+    return result_dir
+
+
+def reset_ocr_result_dir_for_document(document_id: int) -> Path:
+    result_dir = get_ocr_result_dir_for_document(document_id)
+
+    if result_dir.exists():
+        shutil.rmtree(result_dir)
+
+    result_dir.mkdir(parents=True, exist_ok=True)
+    return result_dir
+
+
+def get_combined_text_path(result_dir: Path) -> Path:
+    return result_dir / "combined_text.txt"
+
+
+def get_pages_metadata_path(result_dir: Path) -> Path:
+    return result_dir / "pages.json"
+
+
+def load_saved_ocr_result(result_dir: Path) -> tuple[str, dict] | None:
+    """
+    Если OCR уже был выполнен, возвращает сохранённый текст и metadata.
+    """
+    combined_path = get_combined_text_path(result_dir)
+    metadata_path = get_pages_metadata_path(result_dir)
+
+    if not combined_path.exists():
+        return None
+
+    text = combined_path.read_text(encoding="utf-8")
+
+    metadata = {}
+
+    if metadata_path.exists():
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            metadata = {}
+
+    return text, metadata
+
+
+def render_pdf_page(page: fitz.Page, scale: float = RENDER_SCALE) -> Image.Image:
+    pix = page.get_pixmap(
+        matrix=fitz.Matrix(scale, scale),
+        alpha=False,
     )
+    return Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
 
 
-def crop_margins(gray: np.ndarray) -> np.ndarray:
-    inv = cv2.threshold(gray, 245, 255, cv2.THRESH_BINARY_INV)[1]
-    coords = cv2.findNonZero(inv)
+def read_markdown_files(directory: Path) -> str:
+    """
+    Для LLM нам нужен человекочитаемый Markdown,
+    а не огромный JSON с координатами.
+    """
+    parts: list[str] = []
 
-    if coords is None:
-        return gray
+    for path in sorted(directory.rglob("*.md")):
+        try:
+            content = path.read_text(encoding="utf-8").strip()
+        except Exception:
+            continue
 
-    x, y, w, h = cv2.boundingRect(coords)
-    pad = 15
+        if content:
+            parts.append(content)
 
-    x1 = max(x - pad, 0)
-    y1 = max(y - pad, 0)
-    x2 = min(x + w + pad, gray.shape[1])
-    y2 = min(y + h + pad, gray.shape[0])
-
-    return gray[y1:y2, x1:x2]
-
-
-def deskew_image(gray: np.ndarray) -> np.ndarray:
-    thresh = cv2.threshold(
-        gray,
-        0,
-        255,
-        cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
-    )[1]
-
-    coords = np.column_stack(np.where(thresh > 0))
-    if len(coords) < 100:
-        return gray
-
-    angle = cv2.minAreaRect(coords)[-1]
-    if angle < -45:
-        angle = 90 + angle
-
-    if abs(angle) < 0.3:
-        return gray
-
-    h, w = gray.shape[:2]
-    center = (w // 2, h // 2)
-    matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
-
-    return cv2.warpAffine(
-        gray,
-        matrix,
-        (w, h),
-        flags=cv2.INTER_CUBIC,
-        borderMode=cv2.BORDER_REPLICATE,
-    )
+    return "\n\n".join(parts).strip()
 
 
-def upscale_small_image(
-    gray: np.ndarray,
-    min_width: int = 1800,
-) -> np.ndarray:
-    h, w = gray.shape[:2]
-    if w >= min_width:
-        return gray
-
-    scale = min_width / max(w, 1)
-    return cv2.resize(
-        gray,
-        None,
-        fx=scale,
-        fy=scale,
-        interpolation=cv2.INTER_CUBIC,
-    )
+def save_page_text(result_dir: Path, page_number: int, text: str) -> Path:
+    page_path = result_dir / f"page_{page_number:03d}.md"
+    page_path.write_text(text or "", encoding="utf-8")
+    return page_path
 
 
-def preprocess_for_ocr(
-    image: Image.Image,
-    strong: bool = False,
-) -> Image.Image:
-    bgr = resize_if_needed(pil_to_bgr(image))
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    gray = crop_margins(gray)
-    gray = deskew_image(gray)
-    gray = upscale_small_image(gray)
+def ppstructure_image_to_text(image_path: Path) -> str:
+    pipeline = get_pipeline()
 
-    if strong:
-        gray = cv2.fastNlMeansDenoising(
-            gray,
-            None,
-            h=10,
-            templateWindowSize=7,
-            searchWindowSize=21,
-        )
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        output = pipeline.predict(str(image_path))
 
-        gray = cv2.createCLAHE(
-            clipLimit=2.0,
-            tileGridSize=(8, 8),
-        ).apply(gray)
+        page_parts: list[str] = []
 
-    return Image.fromarray(gray)
+        for i, res in enumerate(output):
+            item_dir = tmpdir_path / f"item_{i + 1}"
+            item_dir.mkdir(parents=True, exist_ok=True)
+
+            try:
+                res.save_to_markdown(str(item_dir))
+            except Exception:
+                pass
+
+            text = read_markdown_files(item_dir)
+
+            if text:
+                page_parts.append(text)
+            else:
+                # fallback, если markdown не сохранился
+                page_parts.append(str(res))
+
+        return "\n\n".join(page_parts).strip()
 
 
 def normalize_cadastral_numbers(text: str) -> str:
@@ -171,27 +187,15 @@ def normalize_ocr_text(text: str) -> str:
     text = text.replace("\xa0", " ")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
-
-    replacements = {
-        "|": "1",
-        "I": "1",
-        "l": "1",
-        "O": "0",
-        "o": "0",
-    }
-
-    def fix_number_like(match: re.Match) -> str:
-        value = match.group(0)
-        for src, dst in replacements.items():
-            value = value.replace(src, dst)
-        return value
-
-    text = re.sub(r"\b[0-9OIlo:]{6,}\b", fix_number_like, text)
     text = normalize_cadastral_numbers(text)
+
     return text.strip()
 
 
 def is_text_bad(text: str) -> bool:
+    """
+    Функция нужна для совместимости с text_extractor.py.
+    """
     text = normalize_ocr_text(text)
 
     if not text or len(text) < 80:
@@ -199,113 +203,189 @@ def is_text_bad(text: str) -> bool:
 
     total = len(text)
     cyr = len(re.findall(r"[А-Яа-яЁё]", text))
-    if cyr / max(total, 1) < 0.35:
+
+    if cyr / max(total, 1) < 0.25:
         return True
 
     weird = len(re.findall(r"[©`_]", text))
-    if weird > 5:
-        return True
-
-    one_char_words = len(re.findall(r"\b[А-Яа-яЁёA-Za-z]\b", text))
-    if one_char_words > 25:
+    if weird > 10:
         return True
 
     return False
 
 
-def run_tesseract(
-    image: Image.Image,
-    config: str,
-    timeout: int,
-) -> str:
-    return pytesseract.image_to_string(
-        image,
-        lang=OCR_LANG,
-        config=config,
-        timeout=timeout,
-    )
+def extract_text_with_paddle_ocr(
+    file_path: str,
+    result_dir: Path,
+) -> tuple[str, dict]:
+    """
+    Выполняет OCR/PP-StructureV3 и сохраняет результат в result_dir.
 
+    Важно:
+    - result_dir должен быть подготовлен заранее;
+    - эта функция не решает, удалять старую папку или нет.
+    """
+    started = time.monotonic()
 
-def extract_text_from_image(
-    image: Image.Image,
-    page_deadline: float,
-) -> str:
-    configs = [
-        "--oem 3 --psm 6",
-        "--oem 3 --psm 4",
+    pages: list[OCRPageResult] = []
+    combined_parts: list[str] = []
+
+    path = Path(file_path)
+
+    if path.suffix.lower() == ".pdf":
+        doc = fitz.open(file_path)
+
+        try:
+            page_count = min(len(doc), MAX_PAGES_FOR_OCR)
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmpdir_path = Path(tmpdir)
+
+                for page_index in range(page_count):
+                    if time.monotonic() - started > MAX_DOCUMENT_OCR_SECONDS:
+                        break
+
+                    page_number = page_index + 1
+
+                    image = render_pdf_page(doc[page_index])
+                    image_path = tmpdir_path / f"page_{page_number:03d}.png"
+                    image.save(image_path)
+
+                    page_text = ppstructure_image_to_text(image_path)
+                    page_text = normalize_ocr_text(page_text)
+
+                    markdown_path = None
+
+                    if page_text and len(page_text) >= MIN_TEXT_LEN:
+                        page_file = save_page_text(
+                            result_dir=result_dir,
+                            page_number=page_number,
+                            text=page_text,
+                        )
+                        markdown_path = str(page_file.relative_to(settings.MEDIA_ROOT))
+
+                        combined_parts.append(
+                            f"--- Страница {page_number} ---\n{page_text}"
+                        )
+
+                    pages.append(
+                        OCRPageResult(
+                            page=page_number,
+                            text=page_text,
+                            text_length=len(page_text or ""),
+                            markdown_path=markdown_path,
+                        )
+                    )
+
+        finally:
+            doc.close()
+
+    else:
+        page_text = ppstructure_image_to_text(path)
+        page_text = normalize_ocr_text(page_text)
+
+        markdown_path = None
+
+        if page_text and len(page_text) >= MIN_TEXT_LEN:
+            page_file = save_page_text(
+                result_dir=result_dir,
+                page_number=1,
+                text=page_text,
+            )
+            markdown_path = str(page_file.relative_to(settings.MEDIA_ROOT))
+            combined_parts.append(page_text)
+
+        pages.append(
+            OCRPageResult(
+                page=1,
+                text=page_text,
+                text_length=len(page_text or ""),
+                markdown_path=markdown_path,
+            )
+        )
+
+    combined_text = "\n\n".join(combined_parts).strip()
+
+    combined_path = result_dir / "combined_text.txt"
+    combined_path.write_text(combined_text, encoding="utf-8")
+
+    pages_metadata = [
+        {
+            "page": page.page,
+            "text_length": page.text_length,
+            "markdown_path": page.markdown_path,
+        }
+        for page in pages
     ]
 
-    variants = [
-        preprocess_for_ocr(image, strong=False),
-        preprocess_for_ocr(image, strong=True),
-    ]
+    metadata = {
+        "ocr_engine": OCR_ENGINE,
+        "elapsed_seconds": round(time.monotonic() - started, 3),
+        "result_dir": str(result_dir.relative_to(settings.MEDIA_ROOT)),
+        "combined_text_path": str(combined_path.relative_to(settings.MEDIA_ROOT)),
+        "page_count_processed": len(pages),
+        "pages": pages_metadata,
+        "processed_at": timezone.now().isoformat(),
+    }
 
-    best_text = ""
-
-    for variant in variants:
-        if time.monotonic() >= page_deadline:
-            break
-
-        for config in configs:
-            if time.monotonic() >= page_deadline:
-                break
-
-            try:
-                text = run_tesseract(
-                    variant,
-                    config=config,
-                    timeout=TESSERACT_TIMEOUT,
-                )
-            except RuntimeError:
-                continue
-
-            text = normalize_ocr_text(text)
-
-            if text and not is_text_bad(text):
-                return text
-
-            if len(text) > len(best_text):
-                best_text = text
-
-    return best_text
-
-
-def render_pdf_page(
-    page: fitz.Page,
-    scale: float = RENDER_SCALE,
-) -> Image.Image:
-    pix = page.get_pixmap(
-        matrix=fitz.Matrix(scale, scale),
-        alpha=False,
+    metadata_path = result_dir / "pages.json"
+    metadata_path.write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2),
+        encoding="utf-8",
     )
-    return Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+
+    return combined_text, metadata
+
+
+def extract_text_with_paddle_ocr_for_document(
+    document,
+    force_ocr: bool = False,
+) -> tuple[str, dict, bool]:
+    """
+    OCR для SourceDocument.
+
+    Возвращает:
+    - text;
+    - metadata;
+    - from_cache: True, если вернули сохранённый результат.
+    """
+    if document.pk is None:
+        raise ValueError("Document must be saved before OCR processing.")
+
+    if force_ocr:
+        result_dir = reset_ocr_result_dir_for_document(document.id)
+    else:
+        result_dir = build_ocr_result_dir_for_document(document.id)
+
+        saved = load_saved_ocr_result(result_dir)
+        if saved is not None:
+            text, metadata = saved
+            return text, metadata, True
+
+    text, metadata = extract_text_with_paddle_ocr(
+        file_path=document.file.path,
+        result_dir=result_dir,
+    )
+
+    document.ocr_result_dir = metadata.get("result_dir", "")
+    document.ocr_engine = metadata.get("ocr_engine", OCR_ENGINE)
+    document.ocr_processed_at = timezone.now()
+    document.save(update_fields=["ocr_result_dir"])
+
+    return text, metadata, False
 
 
 def extract_text_with_ocr(file_path: str) -> str:
-    doc = fitz.open(file_path)
-    pages_text = []
-    started = time.monotonic()
+    """
+    Совместимость со старым text_extractor.py.
 
-    try:
-        for i, page in enumerate(doc):
-            if i >= MAX_PAGES_FOR_OCR:
-                break
-
-            if time.monotonic() - started > MAX_DOCUMENT_OCR_SECONDS:
-                break
-
-            deadline = time.monotonic() + MAX_PAGE_OCR_SECONDS
-
-            try:
-                image = render_pdf_page(page)
-                text = extract_text_from_image(image, deadline)
-            except Exception:
-                text = ""
-
-            if text and len(text) >= MIN_TEXT_LEN:
-                pages_text.append(text)
-
-    finally:
-        doc.close()
-
-    return "\n\n".join(pages_text).strip()
+    Если OCR вызывается без SourceDocument, результат сохраняется
+    во временную папку и не привязывается к БД.
+    Для сохранения в БД используй extract_text_with_paddle_ocr_for_document().
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        text, _metadata = extract_text_with_paddle_ocr(
+            file_path=file_path,
+            result_dir=Path(tmpdir),
+        )
+        return text

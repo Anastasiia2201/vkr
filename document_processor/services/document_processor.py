@@ -14,11 +14,8 @@ from document_processor.models import (
 from .re_parser import parse_egrn_document
 from .text_extractor import extract_text_from_document
 from .storage import move_document_file
-from .ai.llm_rent_contract_resolver import resolve_rent_contract_with_llm
+from .ai.llm_rent_contract_page_resolver import resolve_rent_contract_by_ocr_pages
 from .ai.llm_auction_protocol_resolver import resolve_auction_protocol_with_llm
-
-
-PARSING_VERSION = "v4"
 
 
 def detect_document_type(text: str) -> str:
@@ -357,7 +354,6 @@ def process_egrn_document(document: SourceDocument, text: str) -> None:
     resolved_data = parse_egrn_document(text)
 
     document.metadata = {
-        "parsing_version": PARSING_VERSION,
         "detected_document_type": document.document_type,
         "resolved_by": "parse_egrn_document",
         "resolved_data": resolved_data,
@@ -368,23 +364,16 @@ def process_egrn_document(document: SourceDocument, text: str) -> None:
 
 
 def process_rent_contract_document(document: SourceDocument, text: str) -> None:
-    llm_result = resolve_rent_contract_with_llm(text)
+    llm_result = resolve_rent_contract_by_ocr_pages(document)
 
-    # Текущий rent resolver возвращает просто parsed dict, без обертки.
-    # Но на будущее поддержим и вариант {"raw": ..., "parsed": ...}.
-    if isinstance(llm_result, dict) and "parsed" in llm_result:
-        rent_data = llm_result.get("parsed") or {}
-        llm_raw = llm_result.get("raw")
-    else:
-        rent_data = llm_result or {}
-        llm_raw = None
+    rent_data = llm_result.get("parsed") or {}
 
     document.metadata = {
-        "parsing_version": PARSING_VERSION,
+        **(document.metadata or {}),
         "detected_document_type": document.document_type,
-        "resolved_by": "resolve_rent_contract_with_llm",
+        "resolved_by": "resolve_rent_contract_by_ocr_pages",
         "resolved_data": rent_data,
-        "llm_raw": llm_raw,
+        "llm_raw": llm_result.get("raw"),
     }
     document.save(update_fields=["metadata"])
 
@@ -396,7 +385,6 @@ def process_auction_protocol_document(document: SourceDocument, text: str) -> No
     protocol_data = llm_result.get("parsed") or {}
 
     document.metadata = {
-        "parsing_version": PARSING_VERSION,
         "detected_document_type": document.document_type,
         "resolved_by": "resolve_auction_protocol_with_llm",
         "resolved_data": protocol_data,
@@ -443,7 +431,6 @@ def process_source_document(
 
         else:
             document.metadata = {
-                "parsing_version": PARSING_VERSION,
                 "detected_document_type": document.document_type,
                 "warnings": ["Тип документа не поддерживается."],
             }

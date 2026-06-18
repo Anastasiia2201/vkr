@@ -26,7 +26,6 @@ class CadastralLocation:
 
 
 def fetch_location_by_cadastral_number(cadastral_number: str) -> CadastralLocation:
-    
 
     if 1:
         try:

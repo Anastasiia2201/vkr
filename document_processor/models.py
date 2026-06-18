@@ -25,6 +25,7 @@ class SourceDocument(models.Model):
     )
 
     text_content = models.TextField(blank=True)
+    ocr_result_dir = models.CharField(max_length=500, blank=True)
     ocr_used = models.BooleanField(default=False)
 
     status = models.CharField(
@@ -57,7 +58,7 @@ class LandPlot(models.Model):
         null=True,
         blank=True,
     )
-    use_type = models.CharField(max_length=255, null=True, blank=True)
+    use_type = models.CharField(null=True, blank=True)
 
     egrn_source_document = models.ForeignKey(
         SourceDocument,

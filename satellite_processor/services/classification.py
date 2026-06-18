@@ -142,19 +142,30 @@ def classify_land_plot_by_cadastral_number(
             f"Участок с кадастровым номером {cadastral_number} не найден."
         ) from exc
 
-    try:
-        target_date = get_closest_warm_date()
-        start_date = target_date - timedelta(days=10)
-        end_date = target_date + timedelta(days=10)
+    satellite_image = SatelliteImage.objects.filter(
+        land_plot=land_plot,
+        ndvi__isnull=False,
+    ).exclude(
+        features={}
+    ).order_by(
+        "-acquisition_date",
+        "-created_at",
+    ).first()
 
-        satellite_image = save_planetary_preview(
-            land_plot=land_plot,
-            start_date=start_date,
-            end_date=end_date,
-            max_cloud_cover=max_cloud_cover,
-            max_snow_ice_percentage=max_snow_ice_percentage,
-        )
-    except PlanetaryError as exc:
-        raise ClassificationError(str(exc)) from exc
+    if satellite_image is None:
+        try:
+            target_date = get_closest_warm_date()
+            start_date = target_date - timedelta(days=10)
+            end_date = target_date + timedelta(days=10)
+
+            satellite_image = save_planetary_preview(
+                land_plot=land_plot,
+                start_date=start_date,
+                end_date=end_date,
+                max_cloud_cover=max_cloud_cover,
+                max_snow_ice_percentage=max_snow_ice_percentage,
+            )
+        except PlanetaryError as exc:
+            raise ClassificationError(str(exc)) from exc
 
     return classify_satellite_image(satellite_image)
